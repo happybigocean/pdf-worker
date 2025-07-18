@@ -1,10 +1,17 @@
 import { PDFDocument, degrees } from 'pdf-lib';
 
+/**
+ * POST /rotate  – reads raw/transcript.pdf from R2,
+ *                calls Document AI,
+ *                rotates original PDF (layer-safe),
+ *                writes fixed/corrected_transcript.pdf back to R2
+ * GET  /download – streams the corrected PDF
+ */
 export default {
   async fetch(request, env, ctx) {
     const { pathname } = new URL(request.url);
 
-    // Download corrected PDF
+    /* ---------- Download ---------- */
     if (pathname === '/download') {
       try {
         const pdfObj = await env.SRC.get('fixed/corrected_transcript.pdf');
@@ -14,49 +21,43 @@ export default {
         return new Response(pdfBytes, {
           headers: {
             'Content-Type': 'application/pdf',
-            'Content-Disposition': 'attachment; filename="corrected_transcript.pdf"',
           },
         });
       } catch (err) {
-        console.error('❌ PDF download failed:', err);
+        console.error('PDF download failed:', err);
         return new Response('Internal Server Error', { status: 500 });
       }
     }
 
     // Rotate and correct PDF using Google Document AI
-    if (pathname === '/rotate') {
-      try {
-        console.log('🔄 Starting PDF rotation task');
+    if (pathname === '/rotate' /*&& request.method === 'POST'*/) {
+      
+        console.log('Starting PDF rotation task');
 
         const pdfObj = await env.SRC.get('raw/transcript.pdf');
-        if (!pdfObj) return new Response('PDF not found in R2', { status: 404 });
+        if (!pdfObj) return new Response('PDF not found', { status: 404 });
 
         const rawPdfBytes = await pdfObj.arrayBuffer();
-        const pdfBytes = await normalizeRotation(rawPdfBytes); // flatten to 0° rotation
+        const pdfBytes = await normalizeRotation(rawPdfBytes); 
 
-        const saObj = await env.SRC.get('secret/service_account.json');
-        if (!saObj) return new Response('Service account not found', { status: 500 });
-        const serviceAccountJSON = await saObj.json();
-
+        // 2. OAuth 2 service-account flow (use a Worker secret, not R2!)
+        const jwt = await buildJWT(env.GCP_SA_EMAIL, env.GCP_SA_KEY);
         const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: new URLSearchParams({
             grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-            assertion: await getGoogleJWT(serviceAccountJSON),
+            assertion: jwt,
           }),
         });
-
-        const tokenData = await tokenRes.json();
-        const accessToken = tokenData.access_token;
-        if (!accessToken) throw new Error('Failed to get access token');
+        const { access_token } = await tokenRes.json();
 
         const docAIRes = await fetch(
           `https://us-documentai.googleapis.com/v1/projects/${env.GCP_PROJECT_ID}/locations/${env.GCP_LOCATION}/processors/${env.GCP_PROCESSOR_ID}:process`,
           {
             method: 'POST',
             headers: {
-              Authorization: `Bearer ${accessToken}`,
+              Authorization: `Bearer ${access_token}`,
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({
@@ -67,119 +68,86 @@ export default {
             }),
           }
         );
+      const doc = await docAIRes.json();
+      // 4. Extract rotation per page
+      const angles = (doc.document?.pages || []).map(extractAngle);
 
-        const doc = await docAIRes.json();
-        const pages = doc.document?.pages || [];
+      // 5. Apply rotation loss-lessly
+      const fixedBytes = await rotatePdf(pdfBytes, angles);
 
-        const angles = [];
-        pages.forEach((p, i) => {
-          const transform = p.transforms?.[0];
-          if (transform && transform.data) {
-            try {
-              const decoded = atob(transform.data);
-              const view = new DataView(Uint8Array.from(decoded, c => c.charCodeAt(0)).buffer);
-              const a = view.getFloat32(0, true);
-              const b = view.getFloat32(4, true);
-              const rawAngle = Math.atan2(b, a) * (180 / Math.PI);
-              angles.push(snapAngle((Math.round(rawAngle) + 360) % 360));
-            } catch (e) {
-              console.warn(`⚠️ Failed to decode transform for page ${i + 1}:`, e);
-              angles.push(0);
-            }
-          } else {
-            angles.push(0);
-          }
-        });
+      await env.SRC.put(
+        'fixed/corrected_transcript.pdf',
+        fixedBytes,
+        { httpMetadata: { contentType: 'application/pdf' } },
+      );
+      // copy JSON for downstream search if you like
+      await env.SRC.put('fixed/corrected_transcript.json', JSON.stringify(doc));
 
-        const fixedPdfBytes = await rotateAndFlatten(pdfBytes, angles);
-
-        await env.SRC.put('fixed/corrected_transcript.pdf', fixedPdfBytes, {
-          httpMetadata: { contentType: 'application/pdf' },
-        });
-
-        await env.SRC.put('fixed/corrected_transcript.json', JSON.stringify(doc), {
-          httpMetadata: { contentType: 'application/json' },
-        });
-
-        return new Response('✅ Rotated and saved PDF');
-      } catch (err) {
-        console.error('PDF rotation failed:', err);
-        return new Response('Internal Server Error', { status: 500 });
-      }
+      return new Response('Done');
     }
 
-    return new Response('Worker running. Call /rotate to process PDF, /download to download the fixed PDF.');
-  },
+    return new Response('Worker up. POST /rotate or GET /download');
+  }
 };
 
-// Snap angle to 0, 90, 180, or 270
-function snapAngle(angle) {
-  const candidates = [0, 90, 180, 270];
-  return candidates.reduce((prev, curr) =>
-    Math.abs(curr - angle) < Math.abs(prev - angle) ? curr : prev
-  );
-}
+/* -------- helpers ------------------------------------------------------- */
 
-// Rotate PDF pages based on detected angles
-async function rotateAndFlatten(pdfBytes, angles) {
-  const pdfDoc = await PDFDocument.load(pdfBytes);
-  const newPdf = await PDFDocument.create();
+function extractAngle(page) {
+  if (!page.transforms?.length) return 0;
+  const { rows, cols, data } = page.transforms[0];
+  // data is base-64-encoded float64[]
+  const buf = Uint8Array.from(atob(data), c => c.charCodeAt(0)).buffer;
+  const view = new DataView(buf);
+  const a = view.getFloat64(0, true);       // cosθ
+  const b = view.getFloat64(8, true);       // sinθ
+  const deg = Math.round((Math.atan2(b, a) * 180) / Math.PI);
+  return snapTo90(deg);
+};
 
-  for (let i = 0; i < pdfDoc.getPageCount(); i++) {
-    const [copiedPage] = await newPdf.copyPages(pdfDoc, [i]);
-    const angle = angles[i] || 0;
-    copiedPage.setRotation(degrees(-angle)); // Apply correction
-    newPdf.addPage(copiedPage);
-  }
-
-  return await newPdf.save({ useObjectStreams: true });
-}
+function snapTo90(deg) { return Math.round(deg / 90) * 90; }
 
 // Remove existing rotation metadata
-async function normalizeRotation(pdfBytes) {
-  const pdfDoc = await PDFDocument.load(pdfBytes);
-  const newPdf = await PDFDocument.create();
+async function normalizeRotation(bytes) {
+  const pdf = await PDFDocument.load(bytes);
 
   for (let i = 0; i < pdfDoc.getPageCount(); i++) {
-    const [copiedPage] = await newPdf.copyPages(pdfDoc, [i]);
-    copiedPage.setRotation(degrees(0)); // Remove rotation
-    newPdf.addPage(copiedPage);
+    pdf.getPage(i).setRotation(degrees(0));
   }
 
   return await newPdf.save({ useObjectStreams: true });
 }
 
-// Google JWT Generator for service account
-async function getGoogleJWT(serviceAccountJSON) {
+async function rotatePdf(bytes, angles) {
+  const pdf = await PDFDocument.load(bytes);
+  angles.forEach((deg, i) =>
+    pdf.getPage(i).setRotation(degrees(-deg))   // pdf-lib API
+  );
+  return pdf.save({ useObjectStreams: true });
+}
+
+async function buildJWT(email, pkcs8) {
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: 'RS256', typ: 'JWT' };
   const payload = {
-    iss: serviceAccountJSON.client_email,
-    sub: serviceAccountJSON.client_email,
+    iss: email,
+    sub: email,
     aud: 'https://oauth2.googleapis.com/token',
     scope: 'https://www.googleapis.com/auth/cloud-platform',
     iat: now,
     exp: now + 3600,
   };
-
-  const encoder = new TextEncoder();
-  const base64url = (obj) =>
+  const encode = obj =>
     btoa(JSON.stringify(obj)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  const unsignedJWT = `${base64url(header)}.${base64url(payload)}`;
-
+  const unsigned = `${encode(header)}.${encode(payload)}`;
   const key = await crypto.subtle.importKey(
     'pkcs8',
-    str2ab(serviceAccountJSON.private_key),
-    {
-      name: 'RSASSA-PKCS1-v1_5',
-      hash: 'SHA-256',
-    },
+    str2ab(pkcs8),
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
     false,
-    ['sign']
+    ['sign'],
   );
-
-  const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, encoder.encode(unsignedJWT));
-  return `${unsignedJWT}.${arrayBufferToBase64URL(signature)}`;
+  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(unsigned));
+  return `${unsigned}.${arrayBufferToBase64URL(sig)}`;
 }
 
 // Helpers for encoding
@@ -204,3 +172,20 @@ function arrayBufferToBase64URL(buffer) {
   for (const b of bytes) binary += String.fromCharCode(b);
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
+
+// Load service account from Wrangler secrets
+async function getServiceAccountFromEnv(env) {
+  try {
+    const saJson = env.GCP_SA_KEY ? JSON.parse(env.GCP_SA_KEY) : null;
+    if (saJson) return saJson;
+    if (env.SRC) {
+      const saObj = await env.SRC.get('secret/service_account.json');
+      if (saObj) return await saObj.json();
+    }
+    return null;
+  } catch (e) {
+    console.warn('Failed to load service account JSON from secrets', e);
+    return null;
+  }
+}
+
