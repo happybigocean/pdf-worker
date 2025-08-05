@@ -1,84 +1,32 @@
-# PDF Rotation Worker
+# PDF Rotation & Transcript Extraction Worker
 
-This project is a Cloudflare Worker that processes PDF documents stored in R2, applies deterministic page rotations, and saves the corrected results for download. It uses [pdf-lib](https://github.com/Hopding/pdf-lib) for PDF manipulation and Google Document AI for page analysis.
+## 🔁 /analyze (POST)
+- Loads raw/transcript.pdf from R2.
+- Clears all rotation metadata from the PDF.
+- Runs OCR using Google Document AI OCR Processor.
+- Detects and corrects rotated pages.
+- Saves corrected PDF to fixed/corrected_transcript.pdf in R2.
+- Sends the corrected PDF to the Transcript Extraction Processor.
+- Reformats extracted entities using a JSON schema (schemas/schema.js).
+- Saves the final structured JSON to fixed/extracted_transcript.json.
 
-## Features
+## ⬇️ /download (GET)
 
-- **Rotate PDF Pages:** Automatically rotates specified pages of a PDF (e.g., page 1 to 270°, page 3 to 90°) for consistent orientation.
-- **Flatten Rotation:** Applies rotation to the actual page content so it appears correct in all PDF viewers.
-- **Google Document AI Integration:** Uses Document AI to analyze page transforms (optional/fallback for other pages).
-- **R2 Storage:** Reads and writes PDFs and accompanying JSON files to Cloudflare R2 storage.
-- **JWT Authentication:** Authenticates with Google APIs using a service account.
-- **Download API:** Download the corrected PDF from the worker endpoint.
+- Streams the fixed/extracted_transcript.json file from R2.
 
-## API Endpoints
+## 📦 Requirements
+- GCP_SA_EMAIL: Google service account email
+- GCP_SA_KEY: Google service account private key (PKCS#8)
+- GCP_PROJECT_ID: GCP project ID
+- GCP_LOCATION: GCP region (e.g. us)
+- GCP_OCR_ID: OCR processor ID
+- GCP_EXTRACT_ID: Extraction processor ID
 
-- `GET /rotate`  
-  Processes the original PDF, applies rotations, saves the corrected PDF and a JSON report to R2.
-- `GET /download`  
-  Downloads the corrected PDF (`fixed/corrected_transcript.pdf`) for local testing.
-- `GET /`  
-  Returns a simple status message.
+## 🧠 How it Works
 
-## Usage
-
-1. **Upload Source Files**
-   - Upload your original PDF to R2: `raw/transcript.pdf`
-   - Upload your Google service account JSON to R2: `secret/service_account.json`
-
-2. **Run Rotation**
-   - Send a GET request to `/rotate`.
-   - The worker will:
-     - Authenticate with Google,
-     - Analyze the PDF using Document AI,
-     - Rotate page 1 to 270°, page 3 to 90°, and other pages as needed,
-     - Flatten the rotation (so it's visible in all viewers),
-     - Save the corrected PDF and Document AI JSON result to R2.
-
-3. **Download Corrected PDF**
-   - Send a GET request to `/download`.
-   - The worker will return the corrected PDF as an attachment.
-
-## Example
-
-```sh
-# Rotate and fix the PDF
-curl https://your-worker-url/rotate
-
-# Download the corrected PDF
-curl -O -J https://your-worker-url/download
-```
-
-## Configuration
-
-Set your environment variables for the worker:
-
-- `GCP_PROJECT_ID` - Google Cloud Project ID
-- `GCP_LOCATION` - Document AI processor location (e.g., `us`)
-- `GCP_PROCESSOR_ID` - Document AI processor ID
-
-R2 bindings:
-- `SRC` - R2 bucket binding for source and destination files
-
-## Dependencies
-
-- [pdf-lib](https://github.com/Hopding/pdf-lib)
-- Cloudflare Workers runtime (with R2 binding)
-- Google Document AI API access
-
-## Code Structure
-
-- `worker.js` - Main worker code, entry point
-- `README.md` - This documentation
-
-## License
-
-MIT
-
-## Notes
-
-- Only the rotation for page 1 (index 0) and page 3 (index 2) is forced by default. Adjust logic as needed.
-- If you need to rotate other pages, update the code logic in the rotation array.
-- Flattening is done by copying content to new pages and setting rotation, making the output compatible with all PDF viewers.
-
-```
+1. Rotates and normalizes the original PDF.
+2. Sends to Document AI OCR to extract page orientation.
+3. Applies rotation correction.
+4. Sends to Document AI Extraction Processor.
+5. Validates and maps the response into a custom schema.
+6. Saves structured JSON to R2.
